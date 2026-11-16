@@ -9,7 +9,7 @@
   - Anthropic API（選用：產生「隔天可能走勢」摘要，需 ANTHROPIC_API_KEY）
 
 用法
-  pip install requests yfinance anthropic      # yfinance、anthropic 可省略
+  pip install requests markdown yfinance anthropic   # yfinance、anthropic 可省略
   python tw_stock_daily.py                      # 產生今天的報告（非交易日會自動略過）
   python tw_stock_daily.py --force              # 強制以「最近一個交易日」資料重產（例如隔天早上更新新聞）
   python tw_stock_daily.py --no-ai --no-intl    # 不用 AI 摘要、不抓國際市場
@@ -339,7 +339,63 @@ def build_report(trade_date, mkt, stocks, inst, foreign, intl, news, ai_text):
         L.append("\n## 七、隔天走勢重點（AI 依上列資料整理）\n")
         L.append(ai_text)
     L.append("\n---\n_資料來源：臺灣證券交易所、Google News、Yahoo Finance。僅供資訊整理，不構成投資建議。_")
-    return "\n".join(L)
+    text = "\n".join(L)
+    return re.sub(r"(\n## [^\n]*\n)(\|)", r"\1\n\2", text)  # 標題與表格間補空行
+
+
+
+CSS = """
+:root{--bg:#f6f7f9;--card:#fff;--text:#1f2328;--muted:#6b7280;--line:#e5e7eb;--head:#f1f3f6;--up:#d93025;--down:#188038;--link:#0b57d0}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--text:#e6e8eb;--muted:#9aa1ab;--line:#2b303a;--head:#222731;--up:#ff6b61;--down:#4cc38a;--link:#8ab4f8}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.7 -apple-system,"Segoe UI","Microsoft JhengHei","PingFang TC",sans-serif}
+main{max-width:920px;margin:0 auto;padding:16px}
+h1{font-size:1.5rem;margin:.6em 0 .2em}
+h2{font-size:1.1rem;margin:0 0 .6em;padding-left:.6em;border-left:4px solid var(--link)}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:14px 0}
+.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.93rem;white-space:nowrap}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left}
+th{background:var(--head);font-weight:600}
+td:not(:first-child),th:not(:first-child){text-align:right}
+tr:hover td{background:var(--head)}
+.up{color:var(--up);font-weight:600}.down{color:var(--down);font-weight:600}
+ul{padding-left:1.2em;margin:.3em 0}li{margin:.35em 0}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+em{color:var(--muted)}p{margin:.4em 0}
+.archive a{display:inline-block;margin:2px 10px 2px 0}
+hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+"""
+
+
+def render_html(report_md, title, archive=None):
+    """Markdown 報告 → 有樣式的網頁（表格框線、漲紅跌綠、手機可橫向捲動、深色模式）。"""
+    import markdown
+    body = markdown.markdown(report_md, extensions=["tables"])
+    # 漲紅跌綠（台股慣例）
+    body = re.sub(r"▲([\d.,]+%)", r'<span class="up">▲\1</span>', body)
+    body = re.sub(r"▼([\d.,]+%)", r'<span class="down">▼\1</span>', body)
+    body = re.sub(r"<td([^>]*)>((?:<strong>)?)\+", r'<td\1 class="up">\2+', body)
+    body = re.sub(r"<td([^>]*)>((?:<strong>)?)-(?=\d)", r'<td\1 class="down">\2-', body)
+    body = body.replace("<table>", '<div class="tw"><table>').replace("</table>", "</table></div>")
+    # 每個 <h2> 區塊包成卡片
+    parts = re.split(r"(?=<h2>)", body)
+    head, sections = parts[0], parts[1:]
+    cards = "".join(f"<section>{p}</section>" for p in sections if "<hr" not in p) or body
+    tail = ""
+    if sections and "<hr" in sections[-1]:
+        last = sections[-1]
+        i = last.index("<hr")
+        cards = "".join(f"<section>{p}</section>" for p in sections[:-1]) + f"<section>{last[:i]}</section>"
+        tail = last[i:]
+    arch = ""
+    if archive:
+        links = "".join(f'<a href="{d}.html">{d}</a>' for d in archive)
+        arch = f'<section class="archive"><h2>歷史報告</h2>{links}</section>'
+    return (f'<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{title}</title><style>{CSS}</style></head><body><main>'
+            f'{head}{cards}{arch}{tail}</main></body></html>')
 
 
 def send_telegram(text):
@@ -393,6 +449,18 @@ def main():
     path.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n已儲存：{path}")
+    try:  # 網頁版（需 pip install markdown）；失敗不影響其他輸出
+        (out_dir / "index.md").unlink(missing_ok=True)  # 舊版遺留檔，避免蓋掉網頁版
+        (out_dir / ".nojekyll").write_text("", encoding="utf-8")  # 讓 GitHub Pages 直接顯示 html
+        archive = sorted((p.stem for p in out_dir.glob("20*.html")), reverse=True)
+        if f"{trade_date:%Y-%m-%d}" not in archive:
+            archive.insert(0, f"{trade_date:%Y-%m-%d}")
+        page = render_html(report, f"台股盤後日報 {trade_date:%Y-%m-%d}", archive[:30])
+        (out_dir / f"{trade_date:%Y-%m-%d}.html").write_text(page, encoding="utf-8")
+        (out_dir / "index.html").write_text(page, encoding="utf-8")
+        print(f"已產生網頁：{out_dir / 'index.html'}")
+    except Exception as e:  # noqa: BLE001
+        warn(f"網頁版產生失敗：{e}")
     send_telegram(report)
     return 0
 
