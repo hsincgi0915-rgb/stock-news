@@ -165,6 +165,7 @@ th.s{cursor:pointer;user-select:none}th.s:hover{text-decoration:underline}
 </style></head><body><main>
 <h1>台股選股篩選器</h1>
 <p class="note">資料日期：<b id="dt"></b>　｜　候選池 <b id="pool"></b> 檔（殖利率≥__POOLY__% 且外資或投信買超）　｜　資料每個交易日盤後更新</p>
+<p class="warn" id="partial"></p>
 <section><h2>篩選條件（可自行調整）</h2><div class="params">
 <label>殖利率 ≥ <input type="number" id="y" value="5" step="0.5" min="0"> %</label>
 <label>外資連續買超 ≥ <input type="number" id="fr" value="3" min="0" max="5"> 天</label>
@@ -184,6 +185,7 @@ th.s{cursor:pointer;user-select:none}th.s:hover{text-decoration:underline}
 const D = __DATA__;
 const $ = id => document.getElementById(id);
 $('dt').textContent = D.date; $('pool').textContent = D.stocks.length;
+if (D.processed < D.pool_total) $('partial').textContent = `⚠ 本次只處理了候選池 ${D.processed}/${D.pool_total} 檔（時間上限或證交所限流），名單可能不完整，下次更新會再補。`;
 const P = () => ({y:+$('y').value, fr:+$('fr').value, tr:+$('tr').value, m5:$('m5').checked, m10:$('m10').checked,
   m20:$('m20').checked, kdOn:$('kdOn').checked, ago:+$('ago').value, gap:+$('gap').value, kdUp:$('kdUp').checked, min:+$('min').value});
 function evalRow(s,p){
@@ -249,7 +251,8 @@ def main():
     ap.add_argument("--out", default="docs/screener")
     ap.add_argument("--force", action="store_true", help="（已不需要，保留相容）")
     ap.add_argument("--pool-yield", type=float, default=3.0, help="候選池的殖利率下限（網頁條件不可低於此值）")
-    ap.add_argument("--max-pool", type=int, default=150, help="候選池上限（越大跑越久）")
+    ap.add_argument("--max-pool", type=int, default=120, help="候選池上限（越大跑越久）")
+    ap.add_argument("--max-minutes", type=float, default=25, help="抓歷史股價的時間上限（分鐘）")
     args = ap.parse_args()
 
     today = dt.datetime.now(TZ).date()
@@ -302,21 +305,33 @@ def main():
     cand = cand[:args.max_pool]
     print(f"候選池 {len(cand)} 檔，開始抓歷史股價（約需 {len(cand) * 3 * SLEEP / 60:.0f} 分鐘）…")
 
-    result = []
+    result, processed, fails, t0 = [], 0, 0, time.time()
     for i, c in enumerate(cand, 1):
+        if time.time() - t0 > args.max_minutes * 60:
+            print(f"已達時間上限 {args.max_minutes} 分鐘，停止抓取（已處理 {processed}/{len(cand)} 檔）。")
+            break
+        processed = i
         try:
             ind = indicators(fetch_history(c["code"], months))
+            fails = 0
         except Exception as e:  # noqa: BLE001
             warn(f"{c['code']} 歷史股價失敗：{e}")
+            fails += 1
+            if fails >= 8:
+                print("連續 8 檔失敗，證交所可能暫時限流，停止抓取。")
+                break
             continue
         if ind:
             result.append({**c, **ind})
         if i % 20 == 0:
-            print(f"  進度 {i}/{len(cand)}")
+            print(f"  進度 {i}/{len(cand)}（已用 {(time.time() - t0) / 60:.1f} 分鐘）")
+    if not result:
+        print("沒有取得任何歷史股價，不更新網頁（保留上一次的結果）。", file=sys.stderr)
+        return 1
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_page(out_dir, {"date": f"{latest:%Y-%m-%d}", "stocks": result}, args.pool_yield)
+    write_page(out_dir, {"date": f"{latest:%Y-%m-%d}", "stocks": result, "pool_total": len(cand), "processed": processed}, args.pool_yield)
     print(f"完成：{out_dir / 'index.html'}（{len(result)} 檔）")
     return 0
 
