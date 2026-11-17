@@ -137,22 +137,55 @@ def yi(x):  # 元 → 億元
 
 
 # ----------------------------------------------------------------- 台股資料
-def fetch_market_summary():
+def _mkt_rows_openapi():
     rows = get(f"{OPENAPI}/exchangeReport/FMTQIK")
-    last, prev = rows[-1], rows[-2]
-    close = num(pick(last, "TAIEX", "發行量加權股價指數"))
-    chg = num(pick(last, "Change", "漲跌點數"))
-    value = num(pick(last, "TradeValue", "成交金額"))
-    prev_value = num(pick(prev, "TradeValue", "成交金額"))
+    return [{"date": parse_date(pick(r, "Date", "日期")),
+             "close": num(pick(r, "TAIEX", "發行量加權股價指數")), "change": num(pick(r, "Change", "漲跌點數")),
+             "value": num(pick(r, "TradeValue", "成交金額")), "volume": num(pick(r, "TradeVolume", "成交股數")),
+             "trades": num(pick(r, "Transaction", "成交筆數"))} for r in rows]
+
+
+def _mkt_rows_rwd(today):
+    """證交所官網版（每月一份）；本月資料不足 2 筆時（月初）再補上個月。"""
+    out, y, m = [], today.year, today.month
+    for _ in range(2):
+        j = get(f"{RWD}/afterTrading/FMTQIK", {"date": f"{y}{m:02d}01", "response": "json"})
+        if j.get("stat") == "OK":
+            f = j["fields"]
+            ix = {k: f.index(k) for k in ("日期", "成交股數", "成交金額", "成交筆數", "發行量加權股價指數", "漲跌點數")}
+            for r in j["data"]:
+                out.append({"date": parse_date(r[ix["日期"]]), "close": num(r[ix["發行量加權股價指數"]]),
+                            "change": num(r[ix["漲跌點數"]]), "value": num(r[ix["成交金額"]]),
+                            "volume": num(r[ix["成交股數"]]), "trades": num(r[ix["成交筆數"]])})
+        if len(out) >= 2:
+            break
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    out.sort(key=lambda x: x["date"])
+    return out
+
+
+def fetch_market_summary():
+    """同時查兩個資料來源，採用「日期較新」的那一個，避免其中一個更新較慢。"""
+    today = dt.datetime.now(TZ).date()
+    cands = {}
+    for name, fn in (("官網", lambda: _mkt_rows_rwd(today)), ("OpenAPI", _mkt_rows_openapi)):
+        rows = safe(f"大盤（{name}）", fn)
+        if rows:
+            cands[name] = rows
+    if not cands:
+        raise RuntimeError("兩個大盤資料來源都取得失敗")
+    name, rows = max(cands.items(), key=lambda kv: kv[1][-1]["date"])
+    print("大盤資料日期：" + "、".join(f"{k} {v[-1]['date']}" for k, v in cands.items()) + f" → 採用 {name}")
+    last = rows[-1]
+    prev = rows[-2] if len(rows) > 1 else None
+    close, chg, value = last["close"], last["change"], last["value"]
     return {
-        "date": parse_date(pick(last, "Date", "日期")),
-        "close": close,
-        "change": chg,
+        "date": last["date"], "close": close, "change": chg,
         "pct": chg / (close - chg) * 100 if close and chg is not None else None,
-        "value": value,
-        "volume": num(pick(last, "TradeVolume", "成交股數")),
-        "trades": num(pick(last, "Transaction", "成交筆數")),
-        "value_vs_prev": (value / prev_value - 1) * 100 if value and prev_value else None,
+        "value": value, "volume": last["volume"], "trades": last["trades"],
+        "value_vs_prev": (value / prev["value"] - 1) * 100 if value and prev and prev["value"] else None,
     }
 
 
@@ -167,8 +200,14 @@ def fetch_stocks():
         chg = num(pick(r, "Change", "漲跌價差"))
         if close is None or chg is None or close - chg <= 0:
             continue
+        raw_date = pick(r, "Date", "日期")
+        try:
+            row_date = parse_date(raw_date) if raw_date else None
+        except ValueError:
+            row_date = None
         out.append({
             "code": code,
+            "date": row_date,
             "name": pick(r, "Name", "證券名稱"),
             "close": close,
             "chg": chg,
@@ -275,10 +314,12 @@ def ai_outlook(context):
 
 
 # ----------------------------------------------------------------- 報告
-def build_report(trade_date, mkt, stocks, inst, foreign, intl, news, ai_text):
+def build_report(trade_date, mkt, stocks, inst, foreign, intl, news, ai_text, notice=None):
     L = []
     L.append(f"# 台股盤後日報 {trade_date:%Y-%m-%d}（週{'一二三四五六日'[trade_date.weekday()]}）")
     L.append(f"_產生時間：{dt.datetime.now(TZ):%Y-%m-%d %H:%M}（台北時間）_\n")
+    if notice:
+        L.append(f"> ⚠️ {notice}\n")
 
     L.append("## 一、大盤概況")
     if mkt:
@@ -414,7 +455,7 @@ def send_telegram(text):
 
 def main():
     ap = argparse.ArgumentParser(description="台股盤後日報")
-    ap.add_argument("--force", action="store_true", help="資料日期不是今天也照樣產生（使用最近一個交易日）")
+    ap.add_argument("--force", action="store_true", help="（已不需要，保留相容）一律使用最近一個交易日資料")
     ap.add_argument("--no-ai", action="store_true", help="不產生 AI 摘要")
     ap.add_argument("--no-intl", action="store_true", help="不抓國際市場")
     ap.add_argument("--out", default="reports", help="輸出資料夾（預設 reports）")
@@ -426,12 +467,18 @@ def main():
         print("無法取得大盤資料，結束。", file=sys.stderr)
         return 1
     trade_date = mkt["date"]
-    if trade_date != today and not args.force:
-        print(f"最新資料日期為 {trade_date}，不是今天（{today}）：可能休市或資料尚未發布。"
-              "若要用最近交易日資料產生報告請加 --force。")
-        return 0
+    now = dt.datetime.now(TZ)
+    notice = None
+    if trade_date != today:
+        print(f"資料日期 {trade_date} 不是今天（{today}）：今日休市或證交所尚未更新，先以最近交易日資料產生報告。")
+        if now.weekday() < 5 and now.hour >= 18:
+            notice = f"今天（{today}）的盤後資料尚未取得，或今日休市；以下為最近交易日 {trade_date} 的資料。"
 
     stocks = safe("個股行情", fetch_stocks)
+    if stocks and stocks[0].get("date") and stocks[0]["date"] != trade_date:
+        print(f"個股行情資料日期為 {stocks[0]['date']}，與大盤 {trade_date} 不同，暫不顯示個股排行。")
+        notice = (notice + " " if notice else "") + f"個股排行資料尚未更新到 {trade_date}，暫不顯示。"
+        stocks = None
     inst = safe("三大法人", fetch_institutional, trade_date)
     foreign = safe("外資買賣超", fetch_foreign_top, trade_date)
     intl = None if args.no_intl else safe("國際市場", fetch_intl)
@@ -439,10 +486,10 @@ def main():
 
     ai_text = None
     if not args.no_ai:
-        ctx = build_report(trade_date, mkt, stocks, inst, foreign, intl, news, None)
+        ctx = build_report(trade_date, mkt, stocks, inst, foreign, intl, news, None, notice)
         ai_text = safe("AI 摘要", ai_outlook, ctx)
 
-    report = build_report(trade_date, mkt, stocks, inst, foreign, intl, news, ai_text)
+    report = build_report(trade_date, mkt, stocks, inst, foreign, intl, news, ai_text, notice)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{trade_date:%Y-%m-%d}.md"
